@@ -1,0 +1,52 @@
+name: PrefetchFS
+version: 0.1
+license: GPL-3
+license-file: COPYING
+author: Gergely Risko <gergely@risko.hu>
+maintainer: Gergely Risko <gergely@risko.hu>
+build-type: Simple
+cabal-version: >= 1.6
+category: Console
+homepage: http://github.com/errge/PrefetchFS
+bug-reports: http://github.com/errge/PrefetchFS/issues
+
+synopsis: FUSE filesystem for prefetching big files on-demand
+description:
+  FUSE filesystem for prefetching and storing non-changing big files.
+  .
+  Imagine that you have big media files on a remote filesystem mounted
+  via sshfs or nfs.  Your media player of course prefetches some
+  amount from the files, but not a lot, because prefetching costs
+  memory.  This FUSE filesystem prefetches opened files continously
+  from the last position where it was read.  If you fast forward in
+  your media, it continues prefetching from the new location.  Beside
+  the data, it stores a byte of metadata for every block (4096 by
+  default), so it can continue prefetching between reopens/reboots.
+  .
+  Usage example: TODO
+
+extra-source-files:
+  misc/CacheFS.hs
+  misc/IdentityFS.hs
+  misc/Makefile
+  README.md
+
+source-repository head
+  type: git
+  location: http://github.com/errge/PrefetchFS
+
+executable PrefetchFS
+  main-is: PrefetchFS.hs
+
+  ghc-options: -Wall
+
+  build-depends:
+      base >= 4.6 && < 5
+    , template-haskell >= 2.8
+    , unix >= 2.6
+    , HFuse >= 0.2.4
+    , unix-io-extra >= 0.1
+    , filepath >= 1.3
+    , directory >= 1.2
+    , bytestring >= 0.10
+    , SafeSemaphore >= 0.9
