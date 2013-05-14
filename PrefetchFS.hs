@@ -4,7 +4,6 @@ import Control.Exception
 import Control.Monad (when, unless, void)
 import qualified Data.ByteString as BS
 import Data.ByteString.Internal
-import Data.Maybe
 import Data.Foldable (forM_)
 import Foreign.ForeignPtr.Safe
 import GHC.IO.Exception
