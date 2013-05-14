@@ -38,7 +38,7 @@ source-repository head
 executable PrefetchFS
   main-is: PrefetchFS.hs
 
-  ghc-options: -Wall
+  ghc-options: -Wall -threaded
 
   build-depends:
       base >= 4.6 && < 5
@@ -50,3 +50,4 @@ executable PrefetchFS
     , directory >= 1.2
     , bytestring >= 0.10
     , SafeSemaphore >= 0.9
+    , MissingH >= 1.2

@@ -13,6 +13,7 @@ import System.FilePath.Posix (dropFileName)
 import System.Fuse
 import System.IO
 import System.IO.Error
+import System.Path
 import System.Posix.Directory
 import System.Posix.Files
 import System.Posix.IO
@@ -34,6 +35,16 @@ data State = State { sourceFd :: Fd,
                      blocks :: FileOffset,
                      prefetchSVar :: MSampleVar FileOffset,
                      prefetchThreadId :: Maybe ThreadId }
+
+{- | Return the absolute path of the arg.  Raises an error if the
+computation is impossible. -}
+absPath :: FilePath -> IO FilePath
+absPath inp =
+    do p <- getWorkingDirectory
+       case absNormPath p inp of
+         Nothing -> fail $ "Cannot make " ++ show inp ++ " absolute within " ++
+                    show p
+         Just x -> return x
 
 statusToEntryType :: FileStatus -> EntryType
 statusToEntryType status | isRegularFile status = RegularFile
@@ -65,15 +76,18 @@ fuseStat :: FilePath -> IO FileStat
 fuseStat path = fmap statusToStat $ getSymbolicLinkStatus path
 
 logging :: String -> IO ()
-logging _ = return () -- void (System.IO.hPutStrLn stderr str)
+logging str = void (System.IO.hPutStrLn stderr str)
 
 prefetchStat :: FilePath -> FilePath -> IO (Either Errno FileStat)
 prefetchStat sourceDir path =
   do logging $ "statting " ++ show (sourceDir, path)
+     curdir <- getWorkingDirectory
+     logging $ "curdir: " ++ curdir
      fmap Right (fuseStat $ sourceDir </> path)
        `catch`
        (\e -> case ioeGetErrorType e of
-           GHC.IO.Exception.NoSuchThing -> return $ Left eNOENT
+           GHC.IO.Exception.NoSuchThing -> do logging "ez fut le"
+                                              return $ Left eNOENT
            _ -> throw e)
 
 prefetchReadDir :: FilePath -> FilePath -> IO (Either Errno [(FilePath, FileStat)])
@@ -87,15 +101,15 @@ a `fitDiv` b | a `mod` b == 0 = a `div` b
              | otherwise = a `div` b + 1
 
 prefetchOpen :: FilePath -> FilePath -> FilePath -> OpenMode -> OpenFileFlags -> IO (Either Errno State)
-prefetchOpen sourceDir destDir path mode flags = do
+prefetchOpen sourceDir cacheDir path mode flags = do
   source <- openFd (sourceDir </> path) mode Nothing flags
   size <- fdSeek source SeekFromEnd 0
   logging $ "successful open of " ++ path ++ " with size: " ++ show size
   if (size::COff) > 8388608 -- TODO(errge): option for specifying large files
    then do -- caching only for big files, subtitle hack
-    createDirectoryIfMissing True (dropFileName $ destDir </> path)
-    dest <- openFd (destDir </> path) ReadWrite (Just 438) defaultFileFlags
-    meta <- openFd (destDir </> path ++ ".meta") ReadWrite (Just 438) defaultFileFlags
+    createDirectoryIfMissing True (dropFileName $ cacheDir </> path)
+    dest <- openFd (cacheDir </> path) ReadWrite (Just 438) defaultFileFlags
+    meta <- openFd (cacheDir </> path ++ ".meta") ReadWrite (Just 438) defaultFileFlags
     let blockCount = size `fitDiv` bSizeOff
     setFdSize meta $ fromIntegral blockCount
     svar <- newSV 0
@@ -159,7 +173,7 @@ prefetchRelease _ (State { sourceFd = s, destFd = d, metaFd = m, prefetchThreadI
   closeFd s
 
 prefetchFS :: FilePath -> FilePath -> FuseOperations State
-prefetchFS sourceDir destDir = FuseOperations
+prefetchFS sourceDir cacheDir = FuseOperations
   { fuseGetFileStat = prefetchStat sourceDir
     , fuseReadSymbolicLink = \p -> fmap Right $ readSymbolicLink (sourceDir </> p)
     , fuseCreateDevice =
@@ -176,7 +190,7 @@ prefetchFS sourceDir destDir = FuseOperations
     , fuseSetOwnerAndGroup = \_ _ _ -> return eNOSYS
     , fuseSetFileSize = \p o -> setFileSize (sourceDir </> p) o >> return eOK
     , fuseSetFileTimes = \p t1 t2 -> setFileTimes (sourceDir </> p) t1 t2 >> return eOK
-    , fuseOpen = prefetchOpen sourceDir destDir
+    , fuseOpen = prefetchOpen sourceDir cacheDir
     , fuseRead = prefetchRead
     , fuseWrite =  \_ (State { sourceFd = fd }) bs off -> fmap Right $ pwriteBS fd bs off (BS.length bs)
     , fuseGetFileSystemStats = \_ -> return (Left eNOSYS)
@@ -194,25 +208,26 @@ prefetchFS sourceDir destDir = FuseOperations
 
 prefetchThread :: State -> IO ()
 prefetchThread state =
-  overrideFetch `finally` (logging $ "prefetchThread exit")
+  overrideFetch `finally` logging "prefetchThread exit"
   where
     svNextBlock = prefetchSVar state
     overrideFetch = do
-      logging $ "Getting next block to prefetch from the main thread"
+      logging "Getting next block to prefetch from the main thread"
       readSV svNextBlock >>= prefetch
     prefetch blck | blck >= blocks state || blck < 0 = overrideFetch
-    prefetch blck | otherwise = do
+                  | otherwise = do
       logging $ "prefetching block " ++ show blck
       empty <- isEmptySV svNextBlock
-      case empty of
-        False -> overrideFetch
-        True -> do
-          (void $ readBlock True state blck) `catch` (\e -> when (ioeGetErrorType e /= GHC.IO.Exception.ResourceBusy) (throw e))
+      if not empty
+        then overrideFetch
+        else do
+          void (readBlock True state blck) `catch` (\e -> when (ioeGetErrorType e /= GHC.IO.Exception.ResourceBusy) (throw e))
           prefetch (blck+1)
 
 main :: IO ()
 main =
   do
-    sourceDir:destDir:rest <- getArgs
-    withArgs rest $ do
-      fuseMain (prefetchFS sourceDir destDir) defaultExceptionHandler
+    sourceDir:cacheDir:rest <- getArgs
+    [sourceDirAbs, cacheDirAbs] <- mapM absPath [sourceDir, cacheDir]
+    withArgs rest $
+      fuseMain (prefetchFS sourceDirAbs cacheDirAbs) defaultExceptionHandler
