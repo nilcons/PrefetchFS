@@ -45,7 +45,7 @@ executable PrefetchFS
     , template-haskell >= 2.8
     , unix >= 2.6
     , HFuse >= 0.2.4
-    , unix-io-extra >= 0.1
+    , unix-bytestring >= 0.3.6
     , filepath >= 1.3
     , directory >= 1.2
     , bytestring >= 0.10

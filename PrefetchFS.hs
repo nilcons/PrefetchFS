@@ -1,3 +1,5 @@
+{-# LANGUAGE PackageImports #-}
+
 import Control.Concurrent
 import Control.Concurrent.MSampleVar
 import Control.Exception
@@ -5,7 +7,7 @@ import Control.Monad (when, unless, void)
 import qualified Data.ByteString as BS
 import Data.ByteString.Internal
 import Data.Foldable (forM_)
-import Foreign.ForeignPtr.Safe
+import Foreign.C.Types
 import GHC.IO.Exception
 import System.Directory (createDirectoryIfMissing, getDirectoryContents)
 import System.Environment
@@ -16,14 +18,14 @@ import System.IO.Error
 import System.Path
 import System.Posix.Directory
 import System.Posix.Files
-import System.Posix.IO
-import System.Posix.IO.Extra
+import System.Posix.IO (openFd, defaultFileFlags, setLock, waitToSetLock, closeFd, LockRequest(..))
+import "unix-bytestring" System.Posix.IO.ByteString
 import System.Posix.Types
 
 (</>) :: String -> String -> String
 a </> b = a ++ "/" ++ b
 
-bSize :: Int
+bSize :: CSize
 bSize = 4096
 
 bSizeOff :: COff
@@ -121,18 +123,6 @@ prefetchOpen sourceDir cacheDir path mode flags = do
 rangeToBlocks :: COff -> COff -> [COff]
 rangeToBlocks offset len = [offset `div` bSizeOff .. (offset + len - 1) `div` bSizeOff]
 
-preadBS :: Fd -> COff -> Int -> IO ByteString
-preadBS f offset len = createAndTrim
-                       len
-                       (\buf -> fmap fromIntegral $ pread f buf len offset)
-
-pwriteBS :: Fd -> ByteString -> COff -> Int -> IO ByteCount
-pwriteBS f dat offset len = do
-  let (fp, start, size) = toForeignPtr dat
-  assert (start == 0) $ return ()
-  assert (size == len) $ return ()
-  withForeignPtr fp (\p -> pwrite f p len offset)
-
 oneBS :: ByteString
 oneBS = BS.singleton 1
 
@@ -141,20 +131,20 @@ assertEqM etalon a = do res <- a
                         assert (res == etalon) $ return ()
 
 readBlock :: Bool -> State -> COff -> IO ByteString
-readBlock prefetch (State s d m _ svNextBlock _) blockn | m == -1 = preadBS s (blockn * bSizeOff) bSize
+readBlock prefetch (State s d m _ svNextBlock _) blockn | m == -1 = fdPread s bSize (blockn * bSizeOff)
                                                         | otherwise =
   bracket_
     (lock m (WriteLock, AbsoluteSeek, blockn, 1))
     (lock m (Unlock, AbsoluteSeek, blockn, 1)) $ do
-      [isCached] <- fmap BS.unpack $ preadBS m blockn 1
+      [isCached] <- fmap BS.unpack $ fdPread m 1 blockn
       case isCached of
         1 -> do logging $ "block " ++ show blockn ++ " is already cached"
-                preadBS d (blockn * bSizeOff) bSize
+                fdPread d bSize (blockn * bSizeOff)
         _ -> do logging $ "block " ++ show blockn ++ " is being cached"
                 unless prefetch $ writeSV svNextBlock (blockn + 1)
-                dat <- preadBS s (blockn * bSizeOff) bSize
-                assertEqM (fromIntegral $ BS.length dat) $ pwriteBS d dat (blockn * bSizeOff) (BS.length dat)
-                assertEqM 1 $ pwriteBS m oneBS blockn 1
+                dat <- fdPread s bSize (blockn * bSizeOff)
+                assertEqM (fromIntegral $ BS.length dat) $ fdPwrite d dat (blockn * bSizeOff)
+                assertEqM 1 $ fdPwrite m oneBS blockn
                 logging $ "block " ++ show blockn ++ " caching done"
                 return dat
   where
@@ -192,7 +182,7 @@ prefetchFS sourceDir cacheDir = FuseOperations
     , fuseSetFileTimes = \p t1 t2 -> setFileTimes (sourceDir </> p) t1 t2 >> return eOK
     , fuseOpen = prefetchOpen sourceDir cacheDir
     , fuseRead = prefetchRead
-    , fuseWrite =  \_ (State { sourceFd = fd }) bs off -> fmap Right $ pwriteBS fd bs off (BS.length bs)
+    , fuseWrite =  \_ (State { sourceFd = fd }) bs off -> fmap Right $ fdPwrite fd bs off
     , fuseGetFileSystemStats = \_ -> return (Left eNOSYS)
     , fuseFlush = \_ _ -> return eOK
     , fuseRelease = prefetchRelease
