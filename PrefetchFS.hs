@@ -19,7 +19,8 @@ import System.Path
 import System.Posix.Directory
 import System.Posix.Files
 import System.Posix.IO (openFd, defaultFileFlags, setLock, waitToSetLock, closeFd, LockRequest(..))
-import "unix-bytestring" System.Posix.IO.ByteString
+import "unix-bytestring" System.Posix.IO.ByteString (fdPread, fdPwrite)
+import System.Posix.IO (fdSeek)
 import System.Posix.Types
 
 (</>) :: String -> String -> String
