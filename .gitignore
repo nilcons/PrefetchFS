@@ -1,4 +1,7 @@
 dist
+ssh
+cache
+prefetch
 PrefetchFS32
 PrefetchFS64
 deploy
