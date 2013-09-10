@@ -8,12 +8,8 @@ import Control.Concurrent.MSampleVar
 import Control.Exception
 import Control.Exception.Lens
 import Control.Lens
-import Control.Monad (when, unless, void)
+import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
-import Data.ByteString.Internal
-import Data.Foldable (forM_)
-import Foreign.C.Types
-import GHC.IO.Exception
 import Prelude hiding (log)
 import System.Directory (createDirectoryIfMissing, getDirectoryContents, canonicalizePath)
 import System.Environment
@@ -23,16 +19,13 @@ import System.IO
 import System.IO.Error.Lens
 import System.Posix.Directory
 import System.Posix.Files
-import System.Posix.IO (openFd, defaultFileFlags, waitToSetLock, closeFd, LockRequest(..))
-import "unix-bytestring" System.Posix.IO.ByteString (fdPread, fdPwrite)
+import System.Posix.IO (openFd, defaultFileFlags, closeFd)
 import System.Posix.IO (fdSeek)
 import System.Posix.Types
+import System.Posix.StatVFS
 
-bSize :: CSize
-bSize = 4096
-
-bSizeOff :: COff
-bSizeOff = fromIntegral bSize
+import Common
+import PrefetchHandle
 
 -- The standard </> shipped in System.FilePath.Posix drops `a' if `b'
 -- is absolute, that is not the behavior we want.
@@ -43,25 +36,23 @@ a </> b = a ++ "/" ++ b
 (//) :: COff -> COff -> COff
 a // b = a `div` b + signum (a `mod` b)
 
-log :: String -> IO ()
-log = hPutStrLn stderr
-
 -- General HFuse helper to return (Either Errno)s instead of exceptions.
-runIO :: IO a -> IO (Either Errno a)
-runIO io = handling _IOException errnoHandler (Right <$> io)
+runIOEither :: IO a -> IO (Either Errno a)
+runIOEither io = handling _IOException errnoHandler (Right <$> io)
   where
     errnoHandler e = do
       case e ^. errno of
         Nothing -> throw e
         Just en -> return $ Left $ Errno en
 
-data PrefetchHandle =
-  PrefetchHandle { sourceFd :: Fd
-                 , destFd :: Fd
-                 , metaFd :: Fd
-                 , blocks :: FileOffset
-                 , prefetchSVar :: MSampleVar FileOffset
-                 , prefetchThreadId ::  Maybe ThreadId }
+-- General HFuse helper to return (Errno)s instead of exceptions.
+runIO :: IO () -> IO Errno
+runIO io = handling _IOException errnoHandler (const eOK <$> io)
+  where
+    errnoHandler e = do
+      case e ^. errno of
+        Nothing -> throw e
+        Just en -> return $ Errno en
 
 fuseStat :: FilePath -> IO FileStat
 fuseStat path = statusToStat <$> getSymbolicLinkStatus path
@@ -91,15 +82,30 @@ fuseStat path = statusToStat <$> getSymbolicLinkStatus path
                   | otherwise  = Unknown
 
 prefetchStat :: FilePath -> FilePath -> IO (Either Errno FileStat)
-prefetchStat sourceDir path = runIO $ fuseStat $ sourceDir </> path
+prefetchStat sourceDir path = runIOEither $ fuseStat $ sourceDir </> path
 
-prefetchReadDir :: FilePath -> FilePath -> IO (Either Errno [(FilePath, FileStat)])
-prefetchReadDir sourceDir path = runIO $ do
+prefetchFsStat :: FilePath -> FilePath -> IO (Either Errno FileSystemStats)
+prefetchFsStat sourceDir path = runIOEither $ fuseFsStat $ sourceDir </> path
+  where
+    fuseFsStat :: FilePath -> IO FileSystemStats
+    fuseFsStat p = statVFSToFuseFsStats <$> statVFS p
+    statVFSToFuseFsStats :: StatVFS -> FileSystemStats
+    statVFSToFuseFsStats s = FileSystemStats { fsStatBlockSize = toInteger $ statVFS_bsize s
+                                   , fsStatBlockCount = toInteger $ statVFS_blocks s
+                                   , fsStatBlocksFree = toInteger $ statVFS_bfree s
+                                   , fsStatBlocksAvailable = toInteger $ statVFS_bavail s
+                                   , fsStatFileCount = toInteger $ statVFS_files s
+                                   , fsStatFilesFree = toInteger $ statVFS_ffree s
+                                   , fsStatMaxNameLength = toInteger $ statVFS_namemax s
+                                   }
+
+prefetchReadDirectory :: FilePath -> FilePath -> IO (Either Errno [(FilePath, FileStat)])
+prefetchReadDirectory sourceDir path = runIOEither $ do
   files <- getDirectoryContents $ sourceDir </> path
   zip files <$> mapM (fuseStat . (sourceDir </> path </>)) files
 
 prefetchOpen :: FilePath -> FilePath -> FilePath -> OpenMode -> OpenFileFlags -> IO (Either Errno PrefetchHandle)
-prefetchOpen sourceDir cacheDir path mode flags = runIO $ do
+prefetchOpen sourceDir cacheDir path mode flags = runIOEither $ do
   source <- openFd (sourceDir </> path) mode Nothing flags
   size <- fdSeek source SeekFromEnd 0
   log $ "successful open of " ++ path ++ " with size: " ++ show size
@@ -112,49 +118,30 @@ prefetchOpen sourceDir cacheDir path mode flags = runIO $ do
       let blockCount = size // bSizeOff
       setFdSize meta blockCount
       svar <- newSV 0
-      tid <- forkIO $ prefetchThread (PrefetchHandle source dest meta blockCount svar Nothing)
-      return $ PrefetchHandle source dest meta blockCount svar $ Just tid
-    False -> return $ PrefetchHandle source (-1) (-1) (-1) undefined Nothing
+      tid <- forkIO $ prefetchThread (prefetchHandle source dest meta blockCount svar Nothing)
+      return $ prefetchHandle source dest meta blockCount svar $ Just tid
+    False -> return $ prefetchHandle source (-1) (-1) (-1) undefined Nothing
 
 rangeToBlocks :: COff -> COff -> [COff]
 rangeToBlocks offset len = [offset `div` bSizeOff .. (offset + len - 1) `div` bSizeOff]
 
-readBlock :: Bool -> PrefetchHandle -> COff -> IO ByteString
-readBlock prefetch (PrefetchHandle s d m _ svNextBlock _) blockn
-  | m == -1 = fdPread s bSize (blockn * bSizeOff)
-  | otherwise =
-    bracket_
-      (waitToSetLock m (WriteLock, AbsoluteSeek, blockn, 1))
-      (waitToSetLock m (Unlock, AbsoluteSeek, blockn, 1)) $ do
-        isCached <- fdPread m 1 blockn
-        if isCached == oneBS
-          then do log $ "block " ++ show blockn ++ " is already cached"
-                  fdPread d bSize (blockn * bSizeOff)
-          else do log $ "block " ++ show blockn ++ " is being cached"
-                  unless prefetch $ writeSV svNextBlock (blockn + 1)
-                  dat <- fdPread s bSize (blockn * bSizeOff)
-                  -- try hard to work even when the caching disk is full
-                  (do writtenBytes <- fdPwrite d dat $ blockn * bSizeOff
-                      when (fromIntegral writtenBytes /= BS.length dat) $ throw $ userError "bad pwrite"
-                      void $ fdPwrite m oneBS blockn
-                      log $ "block " ++ show blockn ++ " caching done")
-                    `catch` (\(_ :: IOException) -> do
-                                log $ "block " ++ show blockn ++ " couldn't be cached")
-                  return dat
-          where
-            oneBS = BS.singleton 1
-
 prefetchRead :: FilePath -> PrefetchHandle -> ByteCount -> FileOffset -> IO (Either Errno BS.ByteString)
-prefetchRead _ state len offset = runIO $ do
-  bss <- mapM (readBlock False state) (rangeToBlocks offset (fromIntegral len))
+prefetchRead _ state len offset = runIOEither $ do
+  bss <- mapM (readBlockFromPrefetchHandle False state) (rangeToBlocks offset (fromIntegral len))
   return $ BS.take (fromIntegral len) $ BS.drop (fromIntegral $ offset `mod` bSizeOff) $ BS.concat bss
 
 prefetchRelease :: FilePath -> PrefetchHandle -> IO ()
-prefetchRelease _ (PrefetchHandle { sourceFd = s, destFd = d, metaFd = m, prefetchThreadId = t }) = do
-  forM_ t killThread
-  when (d >= 0) $ closeFd d
-  when (m >= 0) $ closeFd m
-  closeFd s
+prefetchRelease _ = releasePrefetchHandle
+
+prefetchAccess :: FilePath -> FilePath -> Int -> IO Errno
+prefetchAccess sourceDir p bits = runIO_ $ fileAccess (sourceDir </> p) (bits .&. 4 == 1) (bits .&. 2 == 1) (bits .&. 1 == 1)
+  where
+    runIO_ io = do
+      ret <- runIOEither io
+      case ret of
+        Right True -> return eOK
+        Right False -> return eACCES
+        Left en -> return en
 
 prefetchFS :: FilePath -> FilePath -> FuseOperations PrefetchHandle
 prefetchFS sourceDir cacheDir = FuseOperations
@@ -162,49 +149,36 @@ prefetchFS sourceDir cacheDir = FuseOperations
     , fuseReadSymbolicLink = \p -> fmap Right $ readSymbolicLink (sourceDir </> p)
     , fuseCreateDevice =
       \p t m _ -> case t of
-        RegularFile -> openFd (sourceDir </> p) WriteOnly (Just m) defaultFileFlags >>= closeFd >> return eOK
+        RegularFile -> runIO $ openFd (sourceDir </> p) WriteOnly (Just m) defaultFileFlags >>= closeFd
         _ -> return eNOSYS
-    , fuseCreateDirectory = \p m -> createDirectory (sourceDir </> p) m >> return eOK
-    , fuseRemoveLink = \p -> removeLink (sourceDir </> p) >> return eOK
-    , fuseRemoveDirectory = \d -> removeDirectory (sourceDir </> d) >> return eOK
-    , fuseCreateSymbolicLink = \_ _ -> return eNOSYS
-    , fuseRename = \p1 p2 -> rename (sourceDir </> p1) (sourceDir </> p2) >> return eOK
-    , fuseCreateLink = \_ _ -> return eNOSYS
-    , fuseSetFileMode = \p m -> setFileMode (sourceDir </> p) m >> return eOK
-    , fuseSetOwnerAndGroup = \_ _ _ -> return eNOSYS
-    , fuseSetFileSize = \p o -> setFileSize (sourceDir </> p) o >> return eOK
-    , fuseSetFileTimes = \p t1 t2 -> setFileTimes (sourceDir </> p) t1 t2 >> return eOK
+    , fuseCreateDirectory = \p m -> runIO $ createDirectory (sourceDir </> p) m
+    , fuseRemoveLink = \p -> runIO $ removeLink (sourceDir </> p)
+    , fuseRemoveDirectory = \d -> runIO $ removeDirectory (sourceDir </> d)
+    , fuseCreateSymbolicLink = \old new -> runIO $ createSymbolicLink old $ sourceDir </> new
+    , fuseRename = \p1 p2 -> runIO $ rename (sourceDir </> p1) (sourceDir </> p2)
+    , fuseCreateLink = \old new -> runIO $ createLink (sourceDir </> old) (sourceDir </> new)
+    , fuseSetFileMode = \p m -> runIO $ setFileMode (sourceDir </> p) m
+    , fuseSetOwnerAndGroup = \p o g -> runIO $ setOwnerAndGroup (sourceDir </> p) o g
+    , fuseSetFileSize = \p o -> runIO $ setFileSize (sourceDir </> p) o
+    , fuseSetFileTimes = \p t1 t2 -> runIO $ setFileTimes (sourceDir </> p) t1 t2
     , fuseOpen = prefetchOpen sourceDir cacheDir
     , fuseRead = prefetchRead
-    , fuseWrite =  \_ (PrefetchHandle { sourceFd = fd }) bs off -> fmap Right $ fdPwrite fd bs off
-    , fuseGetFileSystemStats = \_ -> return (Left eNOSYS)
+    , fuseWrite = \_filePath pHandle bs offset -> runIOEither $ writeToPrefetchHandle pHandle bs offset
+    , fuseGetFileSystemStats = prefetchFsStat sourceDir
     , fuseFlush = \_ _ -> return eOK
     , fuseRelease = prefetchRelease
-    , fuseSynchronizeFile = \_ _ -> return eNOSYS
-    , fuseOpenDirectory = const $ return eOK
-    , fuseReadDirectory = prefetchReadDir sourceDir
+    , fuseSynchronizeFile = \_ _ -> return eOK
+    , fuseOpenDirectory = \p -> runIO $ do
+      log $ "opendir start" ++ p
+      bracket (openDirStream $ sourceDir </> p) closeDirStream $ const $ return ()
+      log $ "opendir end"
+    , fuseReadDirectory = prefetchReadDirectory sourceDir
     , fuseReleaseDirectory = const $ return eOK
-    , fuseSynchronizeDirectory = \_ _ -> return eNOSYS
-    , fuseAccess = \_ _ -> return eNOSYS
+    , fuseSynchronizeDirectory = \_ _ -> return eOK
+    , fuseAccess = prefetchAccess sourceDir
     , fuseInit = return ()
     , fuseDestroy = return ()
   }
-
-prefetchThread :: PrefetchHandle -> IO ()
-prefetchThread state =
-  overrideFetch `finally` log "prefetchThread exit"
-  where
-    svNextBlock = prefetchSVar state
-    overrideFetch = do
-      log "Getting next block to prefetch from the main thread"
-      readSV svNextBlock >>= prefetch
-    prefetch blck | blck >= blocks state || blck < 0 = overrideFetch
-                  | otherwise = do
-      log $ "prefetching block " ++ show blck
-      void $ readBlock True state blck
-      isEmptySV svNextBlock >>= \case
-        True -> prefetch (blck+1)
-        False -> overrideFetch
 
 main :: IO ()
 main =
