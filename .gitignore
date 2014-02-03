@@ -4,4 +4,4 @@ cache
 prefetch
 PrefetchFS32
 PrefetchFS64
-deploy
+standalone
