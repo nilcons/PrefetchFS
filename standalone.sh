@@ -20,5 +20,5 @@ cd standalone
 
 patchelf --set-interpreter /lib/ld-linux.so.2 PrefetchFS
 mkdir lib
-cp -aLv $(ldd ./PrefetchFS | grep -o '/nix/store/[^ ]*') lib/
+cp -aLv $(ldd ./PrefetchFS | grep -o '/nix/store/[^ ]*' | grep -v '^/nix/store/[a-z0-9]\+-glibc-') lib/
 patchelf --set-rpath '$ORIGIN/lib' PrefetchFS
