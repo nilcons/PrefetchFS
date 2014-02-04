@@ -1,4 +1,6 @@
-#!/bin/bash -e
+#!/bin/bash
+
+set -e
 
 # Use this script to generate a deployment directory in standalone/
 # that contains a built PrefetchFS binary with all the necessary clibs
