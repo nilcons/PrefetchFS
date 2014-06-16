@@ -8,16 +8,19 @@ import Control.Concurrent.MSampleVar
 import Control.Exception
 import Control.Exception.Lens
 import Control.Lens
+import Control.Monad
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import Prelude hiding (log)
 import System.Directory (createDirectoryIfMissing, getDirectoryContents, canonicalizePath)
-import System.Environment
+import System.Environment hiding (getEnv)
+import System.Exit
 import System.FilePath.Posix (dropFileName)
 import System.Fuse
 import System.IO
 import System.IO.Error.Lens
 import System.Posix.Directory
+import System.Posix.Env (getEnv)
 import System.Posix.Files
 import System.Posix.IO (openFd, defaultFileFlags, closeFd)
 import System.Posix.IO (fdSeek)
@@ -183,7 +186,15 @@ prefetchFS sourceDir cacheDir = FuseOperations
 main :: IO ()
 main =
   do
-    sourceDir:cacheDir:rest <- getArgs
+    args <- getArgs
+    when (length args < 3) $ do
+      prg <- getProgName
+      prgenv <- getEnv "STANDALONE_PREFETCHFS_EXECUTABLE"
+      let Just myname = prgenv `mplus` (Just prg)
+      putStrLn $ "Usage: " ++ myname ++ " <srcdir> <cachedir> <mount-point>"
+      putStrLn $ "Or:    " ++ myname ++ " / / --help"
+      exitFailure
+    let sourceDir:cacheDir:rest = args
     [sourceDirAbs, cacheDirAbs] <- mapM canonicalizePath [sourceDir, cacheDir]
     withArgs rest $
       fuseMain (prefetchFS sourceDirAbs cacheDirAbs) defaultExceptionHandler
