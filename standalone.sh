@@ -2,23 +2,45 @@
 
 set -e
 
-# Use this script to generate a deployment directory in standalone/
-# that contains a built PrefetchFS binary with all the necessary clibs
-# included in standalone/lib.  You can then move the standalone
-# subdirectory to any system to use PrefetchFS, without having to
-# worry about libraries.
+# Use this script to generate a deployment directory in
+# PrefetchFS-YYYYMMDD/ that contains a built PrefetchFS binary with
+# all the necessary clibs included in standalone/lib.  You can then
+# move the standalone subdirectory to any system to use PrefetchFS,
+# without having to worry about libraries.
 
-# For this to work, you have to use the GHC provided by
-# Ceh (http://github.com/errge/ceh).
+# This script is designed to be started from shells which have Ceh
+# (http://github.com/errge/ceh) enabled, because this script uses the
+# patchelf binary provided by Ceh, and this script depends on
+# /nix/store included into the library pathnames in the PrefetchFS
+# executable, and most non-Ceh GHCs don't add such pathnames to the
+# executables they create.
+
+DATE=PrefetchFS-$(date +%Y%m%d)
 
 cabal configure --user
 cabal build
-rm -rf standalone
-mkdir standalone
-cp dist/build/PrefetchFS/PrefetchFS standalone
-cd standalone
+rm -rf $DATE
+mkdir $DATE
+cp dist/build/PrefetchFS/PrefetchFS $DATE/PrefetchFS.bin
+LDLINUX=$(ldd dist/build/PrefetchFS/PrefetchFS | grep ld-linux.so.2 | awk '{print $1}')
+cd $DATE
 
-patchelf --set-interpreter /lib/ld-linux.so.2 PrefetchFS
+patchelf --set-interpreter /shimmed/do/not/use/directly PrefetchFS.bin
 mkdir lib
-cp -aLv $(ldd ./PrefetchFS | grep -o '/nix/store/[^ ]*' | grep -v '^/nix/store/[a-z0-9]\+-glibc-') lib/
-patchelf --set-rpath '$ORIGIN/lib' PrefetchFS
+cp -aLv $(ldd ./PrefetchFS.bin | grep -o '/nix/store/[^ ]*') lib/
+cp -aLv $LDLINUX lib/
+patchelf --set-rpath '$ORIGIN/lib' PrefetchFS.bin
+
+cat >PrefetchFS <<'EOF'
+#!/bin/sh
+
+cd $(dirname $(readlink -f "$0"))
+export STANDALONE_PREFETCHFS_EXECUTABLE="$0"
+exec lib/ld-linux.so.2 ./PrefetchFS.bin "$@"
+EOF
+chmod a+x PrefetchFS
+chmod a-x PrefetchFS.bin
+
+cd ..
+
+tar cvfz $DATE.tgz $DATE
