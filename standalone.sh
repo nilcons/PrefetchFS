@@ -29,6 +29,13 @@ patchelf --set-interpreter /shimmed/do/not/use/directly PrefetchFS.bin
 mkdir lib
 cp -aLv $(ldd ./PrefetchFS.bin | grep -o '/nix/store/[^ ]*') lib/
 cp -aLv $LDLINUX lib/
+mkdir lib/gconv
+cp -aLv $(dirname $LDLINUX)/gconv/gconv-modules lib/gconv
+cp -aLv $(dirname $LDLINUX)/gconv/UTF-* lib/gconv
+cp -aLv $(dirname $LDLINUX)/gconv/ISO8859-* lib/gconv
+chmod u+w lib/*
+chmod u+w lib/gconv/*
+
 patchelf --set-rpath '$ORIGIN/lib' PrefetchFS.bin
 
 cat >PrefetchFS <<'EOF'
@@ -36,6 +43,7 @@ cat >PrefetchFS <<'EOF'
 
 cd $(dirname $(readlink -f "$0"))
 export STANDALONE_PREFETCHFS_EXECUTABLE="$0"
+export GCONV_PATH=$PWD/lib/gconv
 exec lib/ld-linux.so.2 ./PrefetchFS.bin "$@"
 EOF
 chmod a+x PrefetchFS
