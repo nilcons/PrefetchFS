@@ -41,10 +41,10 @@ patchelf --set-rpath '$ORIGIN/lib' PrefetchFS.bin
 cat >PrefetchFS <<'EOF'
 #!/bin/sh
 
-cd $(dirname $(readlink -f "$0"))
+STANDALONE_DIR="$(dirname $(readlink -f "$0"))"
 export STANDALONE_PREFETCHFS_EXECUTABLE="$0"
 export GCONV_PATH=$PWD/lib/gconv
-exec lib/ld-linux.so.2 ./PrefetchFS.bin "$@"
+exec "${STANDALONE_DIR}/lib/ld-linux.so.2" "${STANDALONE_DIR}/PrefetchFS.bin" "$@"
 EOF
 chmod a+x PrefetchFS
 chmod a-x PrefetchFS.bin
