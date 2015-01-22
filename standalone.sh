@@ -22,7 +22,8 @@ cabal build
 rm -rf $DATE
 mkdir $DATE
 cp dist/build/PrefetchFS/PrefetchFS $DATE/PrefetchFS.bin
-LDLINUX=$(ldd dist/build/PrefetchFS/PrefetchFS | grep ld-linux.so.2 | awk '{print $1}')
+LDLINUX=$(ldd dist/build/PrefetchFS/PrefetchFS | grep 'ld-linux.*\.so\.2' | awk '{print $1}')
+LDLINUX_NAME=$(basename $LDLINUX)
 cd $DATE
 
 patchelf --set-interpreter /shimmed/do/not/use/directly PrefetchFS.bin
@@ -38,13 +39,13 @@ chmod u+w lib/gconv/*
 
 patchelf --set-rpath '$ORIGIN/lib' PrefetchFS.bin
 
-cat >PrefetchFS <<'EOF'
+cat <<'EOF' | sed -e "s/LDLINUX_NAME/$LDLINUX_NAME/" >PrefetchFS
 #!/bin/sh
 
 STANDALONE_DIR="$(dirname $(readlink -f "$0"))"
 export STANDALONE_PREFETCHFS_EXECUTABLE="$0"
 export GCONV_PATH=$PWD/lib/gconv
-exec "${STANDALONE_DIR}/lib/ld-linux.so.2" "${STANDALONE_DIR}/PrefetchFS.bin" "$@"
+exec "${STANDALONE_DIR}/lib/LDLINUX_NAME" "${STANDALONE_DIR}/PrefetchFS.bin" "$@"
 EOF
 chmod a+x PrefetchFS
 chmod a-x PrefetchFS.bin
