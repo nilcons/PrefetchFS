@@ -15,7 +15,7 @@ set -e
 # executable, and most non-Ceh GHCs don't add such pathnames to the
 # executables they create.
 
-DATE=PrefetchFS-$(date +%Y%m%d)
+DATE=PrefetchFS-$(date +%Y%m%d)-$(ghc --print-target-platform)
 
 cabal configure --user
 cabal build
